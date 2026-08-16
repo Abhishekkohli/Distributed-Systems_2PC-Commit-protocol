@@ -5,6 +5,67 @@ Each cluster replicates its own shard of the data using **Paxos**, and transfers
 clusters are coordinated with the **Two-Phase Commit (2PC)** protocol, so transactions stay
 consistent even when individual servers fail or a transfer must be aborted.
 
+## Architecture
+
+```mermaid
+flowchart LR
+    CSV[("transactions.csv<br/>(sets of transfers)")]
+
+    subgraph Driver["input.py — single process"]
+        direction TB
+        Disp["client driver<br/>decide_cluster(S) · decide_cluster(R)"]
+        Coord["S0 — 2PC coordinator<br/>POST /receive"]
+    end
+
+    CSV --> Disp
+
+    subgraph C1["Cluster 1 — clients 1–1000"]
+        direction TB
+        S1["S1 :8001"] --- DBa[("banka")]
+        S2["S2 :8002"] --- DBb[("bankb")]
+        S3["S3 :8003"] --- DBc[("bankc")]
+    end
+
+    subgraph C2["Cluster 2 — clients 1001–2000"]
+        direction TB
+        S4["S4 :8004"] --- DBd[("bankd")]
+        S5["S5 :8005"] --- DBe[("banke")]
+        S6["S6 :8006"] --- DBf[("bankf")]
+    end
+
+    subgraph C3["Cluster 3 — clients 2001–3000"]
+        direction TB
+        S7["S7 :8007"] --- DBg[("bankg")]
+        S8["S8 :8008"] --- DBh[("bankh")]
+        S9["S9 :8009"] --- DBi[("banki")]
+    end
+
+    Disp ==>|"transfer (or its half)<br/>to the contact server"| S1
+    Disp ==> S4
+    Disp ==> S7
+
+    Coord -.->|"PREPARED / ABORT in,<br/>global COMMIT / ABORT out"| S1
+    Coord -.-> S4
+    Coord -.-> S7
+
+    S1 -.- S2
+    S2 -.- S3
+    S4 -.- S5
+    S5 -.- S6
+    S7 -.- S8
+    S8 -.- S9
+```
+
+Every server is a FastAPI process exposing a single `POST /receive` endpoint; all Paxos and 2PC
+messages — within a cluster and to the coordinator — travel over that one endpoint. Each server
+owns a **private PostgreSQL database** (`banka` for `S1` through `banki` for `S9`), each holding its
+own `datastore`, `keyvalue`, and `wal` tables; replicas within a cluster converge on identical
+contents through Paxos rather than by sharing storage. Servers in a cluster are peers, so any of
+them can lead a transaction — the driver picks the contact server per cluster from the CSV row.
+The `S0` coordinator is not a separate process: `input.py` hosts it alongside the driver, so the
+same process that dispatches transactions also collects the votes and issues the global decision
+(rolling a shard back from its `wal` snapshot on abort).
+
 ## What the system does
 
 Clients are partitioned across clusters (client IDs are assigned to clusters by range). A transfer
@@ -32,6 +93,65 @@ PREPARE  ─▶  PROMISE  ─▶  ACCEPT  ─▶  ACCEPTED  ─▶  COMMIT      
                                           │
                                           ▼
                               PREPARED / ABORT  ─▶  coordinator S0  (2PC, across clusters)
+```
+
+### Paxos message flow inside a cluster
+
+The sequence below traces one transaction through cluster 1, where `S1` is the contact server and
+therefore the leader for this ballot. `S2` is assumed to be lagging, which triggers the
+synchronization built into the prepare phase.
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant CL as input.py (client)
+    participant S1 as S1 (leader)
+    participant S2 as S2 (replica, behind)
+    participant S3 as S3 (replica)
+    participant S0 as S0 (2PC coordinator)
+
+    CL->>S1: transaction (S, R, amt), seq_num as ballot
+
+    rect rgb(235, 243, 255)
+    note over S1,S3: Phase 1 — prepare / promise (also a catch-up step)
+    S1->>S2: PREPARE(ballot, full datastore)
+    S1->>S3: PREPARE(ballot, full datastore)
+    note right of S2: max(transaction_id) is lower than<br/>the leader's, so commit the missing<br/>transactions before promising
+    S2-->>S1: PROMISE(ballot, accept_val)
+    S3-->>S1: PROMISE(ballot, accept_val)
+    end
+
+    rect rgb(255, 245, 230)
+    note over S1: Safety checks on each promise:<br/>balance[S] >= amt, and neither<br/>S nor R is locked
+    alt checks fail
+        S1->>S0: ABORT(ballot, cluster_to_abort)
+        note over S1: ballot stops here — no locks taken
+    else majority of promises and checks pass
+        S1->>S1: lock records S and R
+    end
+    end
+
+    rect rgb(235, 255, 240)
+    note over S1,S3: Phase 2 — accept / accepted
+    S1->>S2: ACCEPT(ballot, (S, R, amt))
+    S1->>S3: ACCEPT(ballot, (S, R, amt))
+    note right of S2: store accept_num / accept_val,<br/>lock S and R locally
+    S2-->>S1: ACCEPTED(ballot, value)
+    S3-->>S1: ACCEPTED(ballot, value)
+    end
+
+    rect rgb(245, 240, 255)
+    note over S1,S3: Phase 3 — commit (broadcast includes the leader itself)
+    S1->>S1: COMMIT(ballot)
+    S1->>S2: COMMIT(ballot)
+    S1->>S3: COMMIT(ballot)
+    note over S1,S3: apply accept_val to datastore,<br/>update balances, release locks
+    end
+
+    opt cross-shard transfer only
+        S1->>S0: PREPARED(ballot, cluster)
+        note over S0: waits for both clusters,<br/>then drives the global<br/>COMMIT or ABORT (WAL rollback)
+    end
 ```
 
 - `PREPARE` doubles as a **synchronization** step: the leader ships its datastore along with the
@@ -125,4 +245,5 @@ At the prompt:
 ## Notes
 
 - `main.py` is empty; `input.py` is the actual entry point.
-- Server `S0` is reserved for the 2PC coordinator role and is not a Paxos replica.
+- `S0` is the 2PC coordinator identity, not a Paxos replica and not a separate process — it is the
+  `/receive` endpoint hosted by `input.py`.
