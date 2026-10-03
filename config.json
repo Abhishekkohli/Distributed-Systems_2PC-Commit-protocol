@@ -1,4 +1,6 @@
 {
   "num_clusters": 3,
-  "cluster_size": 3
+  "cluster_size": 3,
+  "clients_in_cluster": 1000,
+  "base_port": 8000
 }
