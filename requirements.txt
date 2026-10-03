@@ -1,6 +1,7 @@
 fastapi
 uvicorn
 psycopg2-binary
-asyncio
 pydantic
 pandas
+httpx
+requests

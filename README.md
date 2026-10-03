@@ -165,18 +165,22 @@ sequenceDiagram
 | File | Purpose |
 | --- | --- |
 | `input.py` | Entry point. Reads the transaction CSV, decides sender/receiver clusters, dispatches transactions to servers, and hosts the `S0` coordinator endpoint (`/receive`) for `PREPARED`/`ABORT` messages. |
-| `server.py` | `Server` — one replica. Owns its datastore, its Paxos instance, its lock table, and HTTP `send`/`broadcast` to peers. |
+| `server.py` | `Server` — one replica. Owns its datastore, its Paxos instance, its lock table, and HTTP `send`/`broadcast` to peers (`/receive`, `/process`, `/status`). |
 | `paxos.py` | `Paxos` — the consensus state machine: prepare/promise/accept/accepted/commit handlers, plus the cross-shard vote reporting. |
 | `database.py` | `DataBase` — PostgreSQL persistence per server: the transaction `datastore` table, the `keyvalue` balance table, and the `wal` snapshot used for cross-shard rollback. |
+| `config.py` | Loads `config.json` and builds the shared cluster / port / client-range topology. |
 | `models.py` | Pydantic models for `Transaction` and `Client`. |
-| `config.json` | Cluster topology: number of clusters and servers per cluster. |
+| `config.json` | Cluster topology: number of clusters, servers per cluster, clients per cluster, base port. |
+| `transactions.csv` | Sample transaction sets for the driver. |
 
 ## Configuration
 
 ```json
 {
   "num_clusters": 3,
-  "cluster_size": 3
+  "cluster_size": 3,
+  "clients_in_cluster": 1000,
+  "base_port": 8000
 }
 ```
 
@@ -213,25 +217,26 @@ CREATE TABLE public.keyvalue (
 CREATE TABLE public.wal (LIKE public.datastore);
 ```
 
-Database connection settings live in `DataBase.connect_db` in `database.py`; update the host,
-user, and password there to match your local PostgreSQL setup.
+Database connection settings are read from the environment (`PGHOST`, `PGPORT`, `PGUSER`,
+`PGPASSWORD`), with local Postgres defaults. Topology (clusters, ports, client ranges) is
+built once in `config.py` from `config.json`.
 
 ## Running
 
 Start one server process per replica (ports `8001`–`8009` for the default 3×3 topology):
 
 ```bash
-uvicorn server:app --port 8001
-# ... repeat for each server in the topology
+SERVER_ID=S1 uvicorn server:app --port 8001
+# ... repeat for each server in the topology (S2 on 8002, ..., S9 on 8009)
 ```
 
-Then start the client driver:
+Then start the client driver (also hosts the `S0` coordinator on port `8000`):
 
 ```bash
 python input.py
 ```
 
-Set `file_path` in `input.py` to your transaction CSV first. The CSV is grouped into transaction
+By default the driver reads `transactions.csv`. Override with `TRANSACTION_CSV=/path/to/file.csv`. The CSV is grouped into transaction
 sets: a row whose first column holds a set number begins a new set, and the rows that follow
 belong to it. Each row carries the transfer tuple `(S, R, amt)`, the list of live servers, and
 the contact server per cluster.
@@ -244,6 +249,5 @@ At the prompt:
 
 ## Notes
 
-- `main.py` is empty; `input.py` is the actual entry point.
-- `S0` is the 2PC coordinator identity, not a Paxos replica and not a separate process — it is the
-  `/receive` endpoint hosted by `input.py`.
+- `input.py` is the driver entry point; it also starts the `S0` coordinator HTTP server on port `8000`.
+- `S0` is the 2PC coordinator identity, not a Paxos replica — it collects `PREPARED` votes and issues the global `COMMIT` or `ABORT`.
